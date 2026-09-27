@@ -1,0 +1,145 @@
+name: humanpass
+
+# Hardening shared by the runtime services (engine and API).
+# Non-root users are set with USER in each Dockerfile.
+x-hardened: &hardened
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+
+x-migrate: &migrate
+  image: pgvector/pgvector:pg16
+  restart: "no"
+  environment:
+    PGHOST: postgres
+    PGPORT: "5432"
+    PGDATABASE: humanpass
+    PGUSER: postgres
+    PGPASSWORD: ${POSTGRES_PASSWORD:?run scripts/init-env.sh}
+  volumes:
+    - ./db:/db:ro
+  networks:
+    - backend
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    # No published ports: reachable only on the internal backend network.
+    environment:
+      POSTGRES_DB: humanpass
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/init-env.sh}
+      IDENTITY_API_DB_PASSWORD: ${IDENTITY_API_DB_PASSWORD:?run scripts/init-env.sh}
+      BIOMETRIC_ENGINE_DB_PASSWORD: ${BIOMETRIC_ENGINE_DB_PASSWORD:?run scripts/init-env.sh}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - backend
+    healthcheck:
+      # TCP check: the entrypoint's temporary init server listens on the unix socket only,
+      # so this stays unhealthy until db/init has finished.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d humanpass"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  biometric-migrate:
+    <<: *migrate
+    command: ["bash", "/db/migrate.sh", "biometric", "/db/migrations/biometric"]
+
+  identity-migrate:
+    <<: *migrate
+    command: ["bash", "/db/migrate.sh", "identity", "/db/migrations/identity"]
+
+  biometric-engine:
+    <<: *hardened
+    build:
+      context: ./services/biometric-engine
+      target: runtime
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://biometric_engine:${BIOMETRIC_ENGINE_DB_PASSWORD:?run scripts/init-env.sh}@postgres:5432/humanpass
+      SERVICE_TOKEN: ${BIOMETRIC_ENGINE_SERVICE_TOKEN:?run scripts/init-env.sh}
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      biometric-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status == 200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  identity-api:
+    <<: *hardened
+    build:
+      context: ./services/identity-api
+      target: runtime
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      DATABASE_URL: postgresql://identity_api:${IDENTITY_API_DB_PASSWORD:?run scripts/init-env.sh}@postgres:5432/humanpass
+      BIOMETRIC_ENGINE_URL: http://biometric-engine:8000
+      BIOMETRIC_ENGINE_SERVICE_TOKEN: ${BIOMETRIC_ENGINE_SERVICE_TOKEN:?run scripts/init-env.sh}
+    # The ONLY published port in the stack, bound to loopback.
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - backend
+      - edge
+    depends_on:
+      postgres:
+        condition: service_healthy
+      identity-migrate:
+        condition: service_completed_successfully
+      biometric-engine:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  biometric-tests:
+    profiles: ["test"]
+    build:
+      context: ./services/biometric-engine
+      target: test
+    environment:
+      # Integration tests connect as the runtime role, never the superuser.
+      TEST_DATABASE_URL: postgresql://biometric_engine:${BIOMETRIC_ENGINE_DB_PASSWORD:?run scripts/init-env.sh}@postgres:5432/humanpass
+    networks:
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      biometric-migrate:
+        condition: service_completed_successfully
+
+  identity-tests:
+    profiles: ["test"]
+    build:
+      context: ./services/identity-api
+      target: test
+    networks:
+      - backend
+
+networks:
+  backend:
+    internal: true
+  edge: {}
+
+volumes:
+  pgdata: {}

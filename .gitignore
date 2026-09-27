@@ -1,0 +1,30 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Models are downloaded and hash-verified at Docker build time; never committed.
+*.onnx
+
+# Face images must never be committed (the demo uses the user's own photos).
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.bmp
+
+# Node
+node_modules/
+dist/
+coverage/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
